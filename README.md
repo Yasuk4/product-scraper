@@ -27,6 +27,19 @@ This is a configurable scraper for collecting product **name** and **price** fro
    - `products_demo_store.csv`
    - (If `--all`) `products_combined.csv`
 
+## Flags
+
+| Flag               | Example                 | Description                                                                   |
+| ------------------ | ----------------------- | ----------------------------------------------------------------------------- |
+| `--site`           | `--site pigmento_store` | **(Required)** – Selects which configuration from `config_sites.yaml` to use. |
+| `--max-pages`      | `--max-pages 10`        | Limits the number of pages scraped per category.                              |
+| `--delay`          | `--delay 1 3`           | Adds a random delay between 1–3 seconds per page request.                     |
+| `--save-html`      | `--save-html`           | Saves the last fetched page as `last_page.html` for debugging.                |
+| `--output`         | `--output custom.csv`   | Sets a custom name for the CSV output file.                                   |
+| `--enrich-brand`   | `--enrich-brand`        | (Optional) Visits product pages to fill in missing brand info.                |
+| `--use-playwright` | `--use-playwright`      | Forces JavaScript rendering with Playwright.                                  |
+| `--debug`          | `--debug`               | Prints detailed logs for troubleshooting selectors.                           |
+
 ## Finding the Right Selectors
 
 Open a product listing page in Chrome → Right-click → **Inspect**. Identify:
