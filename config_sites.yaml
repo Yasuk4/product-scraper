@@ -1,0 +1,20 @@
+# Define one or more sites with CSS selectors.
+# IMPORTANT: Inspect each target site in your browser (Right-click → Inspect) to confirm selectors.
+# Legal note: Always review the site's Terms of Service and robots.txt. Obtain permission if needed.
+
+demo_store:
+  start_urls:
+    - "https://example.com/category/widgets"
+  item_selector: ".product-card"            # container for each product
+  name_selector: ".product-title"           # CSS for product name (or use name_attr)
+  price_selector: ".price"                  # CSS for product price (or use price_attr)
+  next_page_selector: "a.next"              # CSS for the "next page" link (optional)
+  name_attr: null                           # e.g., "data-name" if name is in an attribute
+  price_attr: null                          # e.g., "data-price" if price is in an attribute
+  extra_fields:
+    sku: ".sku"                             # optional custom fields (add/remove as needed)
+    availability: ".stock"
+  max_pages: 3
+
+# Add more site entries following the same structure, for each domain you want to scrape.
+# If a site uses server-side rendered HTML but different markup, just adapt the selectors.
