@@ -1,4 +1,4 @@
-# Product Scraper (Template)
+# Product Scraper 
 
 This is a configurable scraper for collecting product **name** and **price** from specific pages.
 
