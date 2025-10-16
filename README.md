@@ -10,6 +10,7 @@ This is a configurable scraper for collecting product **name** and **price** fro
 2. In this folder:
    ```powershell
    pip install -r requirements.txt
+   python -m playwright install chromium
    ```
 3. Edit `config_sites.yaml`:
    - Put your store pages under `start_urls`

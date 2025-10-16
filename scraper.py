@@ -1,298 +1,412 @@
 #!/usr/bin/env python3
-"""
-Configurable Web Scraper for Product Name & Price
--------------------------------------------------
-- Works with static pages (server-rendered HTML). For JS-heavy sites, see README notes to switch to Playwright.
-- Configure each site in config_sites.yaml with CSS selectors.
-- Outputs one CSV per site and a combined CSV.
-- Simple politeness: random delay, rotating User-Agents, optional robots.txt check.
-- Pagination supported via a "next page" CSS selector.
+# -*- coding: utf-8 -*-
 
-Usage:
-  python scraper.py --site demo_store
-  python scraper.py --all
-  python scraper.py --site demo_store --max-pages 5 --delay 1.0 2.5
-
-Requires:
-  Python 3.9+
-  pip install -r requirements.txt
-"""
 import argparse
 import csv
-import dataclasses
 import logging
 import random
 import re
-import sys
 import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urljoin, urlparse
 
 import requests
-from bs4 import BeautifulSoup
 import yaml
+from bs4 import BeautifulSoup
 
-# --------------- Helpers ---------------
+# ----------------------------
+# Logging
+# ----------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(levelname)s: %(message)s"
+)
 
-USER_AGENTS = [
-    # A small rotating pool (feel free to extend)
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
-]
-
-PRICE_RE = re.compile(r"([$\€\£\¥\₽\₩\₹\₱\₫\₴\₦]|ARS|USD|EUR)?\s*([0-9]+(?:[.,\s][0-9]{3})*(?:[.,][0-9]{2})?)", re.UNICODE)
-
-def clean_price(text: str) -> Tuple[Optional[str], Optional[float]]:
-    """
-    Extracts currency symbol/code and a numeric value from a price-like string.
-    Returns (currency, value) where value is float with '.' decimal separator.
-    """
-    if not text:
-        return None, None
-    m = PRICE_RE.search(text.replace("\u00A0", " "))
-    if not m:
-        return None, None
-    currency = m.group(1).strip() if m.group(1) else None
-    raw = m.group(2)
-    # Heuristic: if both ',' and '.' appear, assume ',' are thousands and '.' decimal if '.' is the last separator, else vice versa.
-    if ',' in raw and '.' in raw:
-        if raw.rfind('.') > raw.rfind(','):
-            num = raw.replace(',', '')
-        else:
-            num = raw.replace('.', '').replace(',', '.')
-    elif ',' in raw and raw.count(',') > 1:
-        num = raw.replace(',', '')
-    elif ',' in raw:
-        # assume comma is decimal
-        num = raw.replace(',', '.')
-    else:
-        num = raw
-    try:
-        return currency, float(num)
-    except ValueError:
-        return currency, None
-
-def politeness_delay(min_s: float, max_s: float):
-    time.sleep(random.uniform(min_s, max_s))
+# ----------------------------
+# Robots.txt (cached per host)
+# ----------------------------
+_ROBOTS_CACHE = {}
 
 def get_robot_parser(base_url: str):
-    # Minimal robots.txt checker (best-effort). If it fails, default to allowed.
+    """Fetch and cache robots.txt for a given base URL."""
     try:
         from urllib import robotparser
+        parsed = urlparse(base_url)
+        root = f"{parsed.scheme}://{parsed.netloc}"
+        if root in _ROBOTS_CACHE:
+            return _ROBOTS_CACHE[root]
         rp = robotparser.RobotFileParser()
-        robots_url = urljoin(base_url, "/robots.txt")
-        rp.set_url(robots_url)
+        rp.set_url(urljoin(root, "/robots.txt"))
         rp.read()
+        _ROBOTS_CACHE[root] = rp
         return rp
     except Exception:
         return None
 
-# --------------- Data Models ---------------
-
+# ----------------------------
+# Config dataclass
+# ----------------------------
 @dataclass
 class SiteConfig:
     start_urls: List[str]
     item_selector: str
     name_selector: str
     price_selector: str
-    next_page_selector: Optional[str] = None
+
+    # Optional fields you can use in YAML
+    brand_selector: Optional[str] = None
+    link_selector: Optional[str] = None
+    next_page_selector: Optional[str] = None  # fallback if site has classic "Next" link
+
+    # If the value is in an attribute instead of text
     name_attr: Optional[str] = None
     price_attr: Optional[str] = None
-    extra_fields: Dict[str, str] = field(default_factory=dict)  # {field_name: css_selector}
+
+    # Any extra CSS -> column maps you want to scrape
+    extra_fields: Dict[str, str] = field(default_factory=dict)
+
+    # Safety limits
     max_pages: Optional[int] = None
 
-@dataclass
-class Product:
-    site_key: str
-    source_url: str
-    name: str
-    price_text: str
-    currency: Optional[str]
-    price_value: Optional[float]
-    extra: Dict[str, str] = field(default_factory=dict)
 
-# --------------- Core Scraper ---------------
+# ----------------------------
+# Price cleaning (AR formats)
+# ----------------------------
+PRICE_SYM_RE = re.compile(r"[$€£]|ARS|AR\$|USD", re.I)
+NUM_RE = re.compile(r"(\d[\d\.\,]*)")
+
+def clean_price(price_text: str) -> Tuple[Optional[str], Optional[float]]:
+    """
+    Extract currency symbol (if any) and numeric value.
+    Handles formats like "$ 44.500" or "$ 35.600,50".
+    We interpret '.' as thousands and ',' as decimal when both appear.
+    If only '.' appears, we treat it as thousands (AR format).
+    """
+    if not price_text:
+        return None, None
+
+    currency = None
+    sym = PRICE_SYM_RE.search(price_text)
+    if sym:
+        currency = sym.group(0)
+
+    m = NUM_RE.search(price_text.replace("\u00a0", " "))
+    if not m:
+        return currency, None
+
+    raw = m.group(1)
+
+    # Heuristics:
+    #   "44.500" -> 44500.0
+    #   "35.600,50" -> 35600.50
+    #   "124,99" -> 124.99
+    if "," in raw and "." in raw:
+        # thousands '.' and decimal ','
+        raw = raw.replace(".", "").replace(",", ".")
+    elif "," in raw and "." not in raw:
+        # likely decimal comma
+        raw = raw.replace(".", "").replace(",", ".")
+    else:
+        # only dots: treat as thousands
+        raw = raw.replace(".", "")
+
+    try:
+        return currency, float(raw)
+    except ValueError:
+        return currency, None
+
+# ----------------------------
+# Product scraper
+# ----------------------------
+DEFAULT_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0 Safari/537.36"
+    ),
+    "Accept-Language": "es-AR,es;q=0.9,en;q=0.8",
+}
+
+
+def fetch_with_playwright(url: str, wait_state: str = "networkidle") -> Optional[str]:
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception:
+        logging.error("Playwright not installed. Run: pip install playwright && python -m playwright install")
+        return None
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        try:
+            ctx = browser.new_context()
+            page = ctx.new_page()
+            page.goto(url, wait_until="domcontentloaded")
+            page.wait_for_load_state(wait_state)
+            return page.content()
+        finally:
+            browser.close()
+
 
 class ProductScraper:
-    def __init__(self, cfg_path: str, min_delay: float = 1.0, max_delay: float = 2.5,
-                 obey_robots: bool = True, timeout: float = 20.0):
-        with open(cfg_path, "r", encoding="utf-8") as f:
-            self.configs: Dict[str, SiteConfig] = {
-                k: SiteConfig(**v) for k, v in yaml.safe_load(f).items()
-            }
-        self.min_delay = min_delay
-        self.max_delay = max_delay
-        self.obey_robots = obey_robots
-        self.timeout = timeout
-        self.session = requests.Session()
+    def __init__(self, config_path: str, args):
+        self.args = args
+        with open(config_path, "r", encoding="utf-8") as f:
+            raw_cfg = yaml.safe_load(f)
+        # Build site configs
+        self.configs: Dict[str, SiteConfig] = {k: SiteConfig(**v) for k, v in raw_cfg.items()}
 
-    def fetch(self, url: str) -> Optional[str]:
-        headers = {"User-Agent": random.choice(USER_AGENTS)}
-        try:
-            resp = self.session.get(url, headers=headers, timeout=self.timeout)
-            resp.raise_for_status()
-            return resp.text
-        except requests.RequestException as e:
-            logging.warning("Request failed for %s: %s", url, e)
-            return None
+        self.session = requests.Session()
+        self.session.headers.update(DEFAULT_HEADERS)
 
     def allowed_by_robots(self, url: str) -> bool:
-        if not self.obey_robots:
+        if self.args.no_robots:
             return True
-        parsed = urlparse(url)
-        base = f"{parsed.scheme}://{parsed.netloc}"
-        rp = get_robot_parser(base)
-        if rp is None:
+        rp = get_robot_parser(url)
+        if not rp:
             return True
-        ua = "Mozilla/5.0"  # generic ua
+        return rp.can_fetch(self.session.headers.get("User-Agent", "*"), url)
+
+    def polite_sleep(self):
+        lo, hi = self.args.delay
+        if hi <= 0:
+            return
+        time.sleep(random.uniform(lo, hi))
+
+    def fetch(self, url: str) -> Optional[str]:
+        if not self.allowed_by_robots(url):
+            logging.warning(f"Blocked by robots.txt: {url}")
+            return None
         try:
-            return rp.can_fetch(ua, url)
-        except Exception:
-            return True
+            resp = self.session.get(url, timeout=30)
+            if resp.status_code >= 400:
+                logging.warning(f"HTTP {resp.status_code} for {url}")
+                return None
+            return resp.text
+        except requests.RequestException as e:
+            logging.warning(f"Request failed for {url}: {e}")
+            return None
 
-    def parse_products_from_html(self, html: str, site: SiteConfig, page_url: str) -> List[Product]:
-        soup = BeautifulSoup(html, "lxml")
-        out: List[Product] = []
-        for item in soup.select(site.item_selector):
-            # Name
-            name_el = item.select_one(site.name_selector)
-            if not name_el:
-                continue
-            name = name_el.get_text(strip=True) if not site.name_attr else name_el.get(site.name_attr, "").strip()
+    def parse_products_from_html(self, site_key: str, html: str, page_url: str, site: SiteConfig) -> List[Dict]:
+        soup = BeautifulSoup(html, "html.parser")
+        items = soup.select(site.item_selector)
+        out: List[Dict] = []
 
-            # Price
-            price_el = item.select_one(site.price_selector)
-            if not price_el:
+        for item in items:
+            # -------- BRAND (optional) --------
+            brand_text = ""
+            if site.brand_selector:
+                be = item.select_one(site.brand_selector)
+                if be:
+                    brand_text = be.get_text(strip=True)
+
+            # -------- Fallback if brand not found --------
+            if site.brand_selector:
+                be = item.select_one(site.brand_selector)
+                if be:
+                    brand_text = be.get_text(strip=True)
+        
+
+            # -------- NAME --------
+            name_text = ""
+            ne = item.select_one(site.name_selector)
+            if ne:
+                if site.name_attr:
+                    name_text = (ne.get(site.name_attr) or "").strip()
+                else:
+                    name_text = ne.get_text(strip=True)
+
+            # Combine brand + name with a space if brand exists
+            full_name = f"{brand_text} {name_text}".strip()
+
+            # -------- PRICE --------
+            pe = item.select_one(site.price_selector)
+            if not pe:
+                # Try a stronger fallback: if price_selector has multiple options comma-separated,
+                # BeautifulSoup already handled it; otherwise, skip item.
                 continue
-            price_text = price_el.get_text(strip=True) if not site.price_attr else price_el.get(site.price_attr, "").strip()
+
+            if site.price_attr:
+                price_text = (pe.get(site.price_attr) or "").strip()
+            else:
+                # If the selector returns a wrapper (e.g., spans inside), get all text
+                price_text = pe.get_text(" ", strip=True)
+
             currency, price_val = clean_price(price_text)
 
-            # Extras
-            extras = {}
-            for field, css in site.extra_fields.items():
-                el = item.select_one(css)
-                extras[field] = el.get_text(strip=True) if el else ""
+            # -------- PRODUCT URL (optional) --------
+            url_val = None
+            if site.link_selector:
+                le = item.select_one(site.link_selector)
+                href = le.get("href") if le else None
+                if href:
+                    url_val = urljoin(page_url, href)
 
-            out.append(Product(
-                site_key="",  # filled later by caller
-                source_url=page_url,
-                name=name,
-                price_text=price_text,
-                currency=currency,
-                price_value=price_val,
-                extra=extras
-            ))
+            # -------- EXTRAS --------
+            extras = {}
+            for col, css in (site.extra_fields or {}).items():
+                if not css:
+                    extras[col] = ""
+                    continue
+                ex = item.select_one(css)
+                extras[col] = ex.get_text(strip=True) if ex else ""
+
+            out.append(
+                {
+                    "site_key": site_key,
+                    "source_url": page_url,
+                   # "url": url_val or "",
+                    "brand": brand_text,
+                    "name": full_name or name_text,
+                    "price_text": price_text,
+                    "currency": currency or "",
+                   # "price_value": price_val if price_val is not None else "",
+                    **extras,
+                }
+            )
+
         return out
 
-    def find_next_page(self, html: str, site: SiteConfig, current_url: str) -> Optional[str]:
-        if not site.next_page_selector:
-            return None
-        soup = BeautifulSoup(html, "lxml")
-        el = soup.select_one(site.next_page_selector)
-        if not el:
-            return None
-        href = el.get("href") or el.get("data-href")
-        if not href:
-            return None
-        return urljoin(current_url, href)
+    def scrape_site(self, site_key: str, site: SiteConfig) -> List[Dict]:
+        logging.info(f"Scraping site: {site_key}")
+        rows: List[Dict] = []
 
-    def scrape_site(self, key: str, limit_pages: Optional[int] = None) -> List[Product]:
-        if key not in self.configs:
-            raise KeyError(f"Unknown site key: {key}")
-        site = self.configs[key]
-        results: List[Product] = []
-        max_pages = limit_pages or site.max_pages
-        visited = 0
-        for start_url in site.start_urls:
-            url = start_url
-            while url:
-                if not self.allowed_by_robots(url):
-                    logging.info("Blocked by robots.txt: %s", url)
-                    break
-                html = self.fetch(url)
+        for base_url in site.start_urls:
+            max_pages = self.args.max_pages or site.max_pages or 1
+
+            for page_idx in range(1, max_pages + 1):
+                # Prefer explicit ?page=N pagination (fast + no JS)
+                paged_url = base_url
+                sep = "&" if "?" in base_url else "?"
+                # Only append ?page= if the base URL doesn't already have a page param
+                if "page=" not in base_url.lower():
+                    paged_url = f"{base_url}{sep}page={page_idx}"
+
+                html = self.fetch(paged_url)
                 if not html:
                     break
-                items = self.parse_products_from_html(html, site, url)
-                for p in items:
-                    p.site_key = key
-                results.extend(items)
-                visited += 1
-                if max_pages and visited >= max_pages:
-                    break
-                nxt = self.find_next_page(html, site, url)
-                if nxt and nxt != url:
-                    politeness_delay(self.min_delay, self.max_delay)
-                    url = nxt
+
+                # If we suspect JS-injected prices, try Playwright
+                need_js = False
+
+                if self.args.save_html:
+                    # quick check: if no "$" in the HTML, likely no prices yet
+                    if "$" not in html:
+                        need_js = True
                 else:
+                    # Or decide via a cheap probe: if item cards exist but price selector finds zero in raw HTML
+                    soup_probe = BeautifulSoup(html, "html.parser")
+                    cards_cnt = len(soup_probe.select(site.item_selector))
+                    prices_cnt = len(soup_probe.select(site.price_selector)) if site.price_selector else 0
+                    if cards_cnt > 0 and prices_cnt == 0:
+                        need_js = True
+
+                if need_js:
+                    print("DEBUG: Switching to Playwright for", paged_url)
+                    html_js = fetch_with_playwright(paged_url, wait_state="networkidle")
+                    if html_js:
+                        html = html_js
+
+
+                # ✅ Debug selector counts on the first page only
+                if page_idx == 1:  # only run once per category to avoid spam
+                    soup = BeautifulSoup(html, "html.parser")
+                    probes = [
+                        (f"item_selector ({site.item_selector})", site.item_selector),
+                        ("alt item .vtex-product-summary-2-x-container", ".vtex-product-summary-2-x-container"),
+                        ("name .vtex-product-summary-2-x-nameContainer", ".vtex-product-summary-2-x-nameContainer"),
+                        ("price default", "span.vtex-product-price-1-x-sellingPriceValue, span.vtex-product-price-1-x-currencyContainer"),
+                        ("price generic", "span[class*='BestPrice'], span[class*='price'], span[class*='currency']"),
+                    ]
+                    for label, css in probes:
+                        try:
+                            cnt = len(soup.select(css))
+                            print(f"DEBUG: {label} -> {cnt}")
+                        except Exception:
+                            pass
+
+                # Optional debug: write the last fetched page to disk
+                if self.args.save_html:
+                    with open("last_page.html", "w", encoding="utf-8") as _f:
+                        _f.write(html)
+
+                # Parse items on this page
+                page_rows = self.parse_products_from_html(site_key, html, paged_url, site)
+                if not page_rows and page_idx == 1 and site.next_page_selector:
+                    # If selectors returned nothing, try a "next page" fallback on the first page
+                    # (useful for non-?page sites)
+                    soup = BeautifulSoup(html, "html.parser")
+                    next_link = soup.select_one(site.next_page_selector)
+                    if next_link and next_link.get("href"):
+                        next_url = urljoin(paged_url, next_link.get("href"))
+                        html2 = self.fetch(next_url)
+                        if html2:
+                            if self.args.save_html:
+                                with open("last_page.html", "w", encoding="utf-8") as _f:
+                                    _f.write(html2)
+                            page_rows = self.parse_products_from_html(site_key, html2, next_url, site)
+
+                rows.extend(page_rows)
+
+                # Stop early if this page had 0 items (likely no more pages)
+                if not page_rows:
                     break
-        return results
 
-# --------------- CLI ---------------
+                self.polite_sleep()
 
-def write_csv(path: str, products: List[Product]):
-    fieldnames = ["site_key", "name", "currency", "price_value", "price_text", "source_url"]
-    # Include extras dynamically
-    extra_keys = sorted({k for p in products for k in p.extra.keys()})
-    fieldnames.extend(extra_keys)
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=fieldnames)
-        w.writeheader()
-        for p in products:
-            row = {
-                "site_key": p.site_key,
-                "name": p.name,
-                "currency": p.currency or "",
-                "price_value": f"{p.price_value:.2f}" if p.price_value is not None else "",
-                "price_text": p.price_text,
-                "source_url": p.source_url,
-            }
-            for k in extra_keys:
-                row[k] = p.extra.get(k, "")
-            w.writerow(row)
+        return rows
+
+    def write_csv(self, site_key: str, rows: List[Dict]):
+        out_name = f"products_{site_key}.csv"
+        if not rows:
+            logging.info(f"Wrote {out_name} (0 rows)")
+            with open(out_name, "w", newline="", encoding="utf-8") as f:
+                f.write("")  # empty file, still created
+            return
+
+        # Build headers from all keys seen (stable order for common fields)
+        base_cols = ["site_key", "source_url", "url", "brand", "name", "currency", "price_value", "price_text"]
+        extra_cols = []
+        for r in rows:
+            for k in r.keys():
+                if k not in base_cols and k not in extra_cols:
+                    extra_cols.append(k)
+        headers = base_cols + [c for c in extra_cols if c not in base_cols]
+
+        with open(out_name, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=headers)
+            writer.writeheader()
+            writer.writerows(rows)
+
+        logging.info(f"Wrote {out_name} ({len(rows)} rows)")
+
+# ----------------------------
+# CLI
+# ----------------------------
+def parse_args():
+    p = argparse.ArgumentParser(description="Simple YAML-driven product scraper")
+    p.add_argument("--site", required=True, help="Site key from config_sites.yaml")
+    p.add_argument("--config", default="config_sites.yaml", help="Path to YAML config")
+    p.add_argument("--max-pages", type=int, default=None, help="Override max_pages from YAML")
+    p.add_argument("--delay", nargs=2, type=float, default=[1.0, 2.5], metavar=("MIN", "MAX"),
+                   help="Random delay range between requests (seconds). Use 0 0 to disable.")
+    p.add_argument("--no-robots", action="store_true", help="Ignore robots.txt (use only if you have permission)")
+    p.add_argument("--save-html", action="store_true", help="Save last fetched page as last_page.html for debugging")
+    return p.parse_args()
 
 def main():
-    parser = argparse.ArgumentParser(description="Web scraper for product name & price (static HTML).")
-    parser.add_argument("--config", default="config_sites.yaml", help="YAML config with site definitions")
-    parser.add_argument("--site", help="Site key to scrape (as defined in YAML)")
-    parser.add_argument("--all", action="store_true", help="Scrape all configured sites")
-    parser.add_argument("--max-pages", type=int, help="Max pages per site (overrides per-site max)")
-    parser.add_argument("--delay", nargs=2, type=float, metavar=("MIN", "MAX"),
-                        help="Random delay range in seconds (default 1.0 2.5)")
-    parser.add_argument("--no-robots", action="store_true", help="Ignore robots.txt (not recommended)")
-    args = parser.parse_args()
+    args = parse_args()
+    scraper = ProductScraper(args.config, args)
 
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+    site_key = args.site
+    if site_key not in scraper.configs:
+        logging.error(f"Site '{site_key}' not found in {args.config}")
+        return
 
-    min_delay, max_delay = (1.0, 2.5)
-    if args.delay:
-        min_delay, max_delay = args.delay
-
-    scraper = ProductScraper(
-        cfg_path=args.config,
-        min_delay=min_delay,
-        max_delay=max_delay,
-        obey_robots=not args.no_robots,
-    )
-
-    if not args.site and not args.all:
-        parser.error("You must provide --site KEY or --all")
-
-    site_keys = list(scraper.configs.keys()) if args.all else [args.site]
-    combined: List[Product] = []
-    for key in site_keys:
-        logging.info("Scraping site: %s", key)
-        products = scraper.scrape_site(key, limit_pages=args.max_pages)
-        out_csv = f"products_{key}.csv"
-        write_csv(out_csv, products)
-        logging.info("Wrote %s (%d rows)", out_csv, len(products))
-        combined.extend(products)
-
-    if len(site_keys) > 1:
-        write_csv("products_combined.csv", combined)
-        logging.info("Wrote products_combined.csv (%d rows)", len(combined))
+    site = scraper.configs[site_key]
+    rows = scraper.scrape_site(site_key, site)
+    scraper.write_csv(site_key, rows)
 
 if __name__ == "__main__":
     main()
+

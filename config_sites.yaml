@@ -2,19 +2,36 @@
 # IMPORTANT: Inspect each target site in your browser (Right-click → Inspect) to confirm selectors.
 # Legal note: Always review the site's Terms of Service and robots.txt. Obtain permission if needed.
 
-demo_store:
+pigmento_store:
   start_urls:
-    - "https://example.com/category/widgets"
-  item_selector: ".product-card"            # container for each product
-  name_selector: ".product-title"           # CSS for product name (or use name_attr)
-  price_selector: ".price"                  # CSS for product price (or use price_attr)
-  next_page_selector: "a.next"              # CSS for the "next page" link (optional)
-  name_attr: null                           # e.g., "data-name" if name is in an attribute
-  price_attr: null                          # e.g., "data-price" if price is in an attribute
-  extra_fields:
-    sku: ".sku"                             # optional custom fields (add/remove as needed)
-    availability: ".stock"
+    - "https://www.perfumeriaspigmento.com.ar/perfume"
+    - "https://www.perfumeriaspigmento.com.ar/maquillaje"
+    - "https://www.perfumeriaspigmento.com.ar/tratamiento"
+    - "https://www.perfumeriaspigmento.com.ar/capilar"            # lowercase
+    - "https://www.perfumeriaspigmento.com.ar/cuidado-personal"
+    - "https://www.perfumeriaspigmento.com.ar/hogar/limpieza/perfumes-para-el-hogar?initialMap=c&initialQuery=hogar&map=category-1,category-2,category-2"
+
+  # Product card (include a fallback container variant)
+  item_selector: ".vtex-search-result-3-x-galleryItem, .vtex-product-summary-2-x-container"
+
+  # Brand + Name (either works across VTEX themes)
+  brand_selector: ".vtex-product-summary-2-x-productBrand, .vtex-product-summary-2-x-productBrandContainer, .vtex-product-summary-2-x-brandName, .vtex-store-components-3-x-productBrand"
+  name_selector: ".vtex-product-summary-2-x-nameContainer, .vtex-store-components-3-x-productBrand--product-name-pdp"
+
+  # PRICE: try common VTEX classes + generic fallbacks (matches most themes)
+  price_selector: ".perfugroupar-store-theme-2Ne74nAuD2L_rWdv78ihTy"
+
+  # VTEX “next” link (kept here just in case, but you’re using ?page=N)
+  next_page_selector: "a.vtex-search-result-3-x-paginationLink--next"
+
   max_pages: 3
+
+  name_attr: null
+  price_attr: null
+  extra_fields: {}
+
+  extra_fields:
+    size: ".vtex-product-summary-2-x-skuSelectorItemTextValue, .vtex-store-components-3-x-skuSelectorItemTextValue"
 
 # Add more site entries following the same structure, for each domain you want to scrape.
 # If a site uses server-side rendered HTML but different markup, just adapt the selectors.
